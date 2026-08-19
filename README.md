@@ -2,7 +2,7 @@
 
 ### [Website](https://robomme.github.io/) | [Paper](https://arxiv.org/abs/2603.04639) | [Benchmark Repo](https://github.com/RoboMME/robomme_benchmark) | [Dataset](https://huggingface.co/datasets/Yinpei/robomme_data_h5) | [Models](https://huggingface.co/Yinpei/mme_vla_suite) | [Leaderboard](https://robomme.github.io/leaderboard.html)
 
-## 🧭 Outline
+## 🧭 Outline 
 
 - [Updates](https://github.com/RoboMME/robomme_policy_learning?tab=readme-ov-file#%EF%B8%8F-updates)
 - [Installation](https://github.com/RoboMME/robomme_policy_learning?tab=readme-ov-file#-installation)

@@ -68,7 +68,8 @@ def init_wandb(
     enabled: bool = True,
 ):
     if not enabled:
-        wandb.init(mode="disabled")
+        wandb.log = lambda *a, **k: None
+        wandb.Image = lambda *a, **k: None
         return
 
     ckpt_dir = config.checkpoint_dir
@@ -281,6 +282,13 @@ def train_step(
     }
     if config.model.use_history and hasattr(grads, "mem_encoder"):
         info["mem_enc_norm"] = optax.global_norm(grads.mem_encoder)
+
+    # A2R 的诊断量（a2r_overlap 等）由 compute_loss 放进 stats。stats 原本只在
+    # recurrent 那条路径下才会被打印，所以把里面的标量并进 info——info 每个
+    # log_interval 都会打印并上报 wandb。非 A2R 的配置里没有这些键，行为不变。
+    for _k, _v in (stats or {}).items():
+        if isinstance(_k, str) and _k.startswith("a2r_"):
+            info[_k] = jnp.mean(_v)
 
     return new_state, info, stats
 

@@ -97,6 +97,16 @@ class MemoryAttention(nn.Module):
         attn_mask = mem_mask[:, None, None, None, :]  # (B, 1, 1, 1, S)
         masked_logits = jnp.where(attn_mask, logits, -2.3819763e38)
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(x.dtype)
+        # A2R relevance channel (P_j): the action tokens' attention over the memory
+        # sequence, reduced to one score per memory token -- mean over kv-heads, head
+        # groups and action positions, so probs (B,K,G,T,S) -> (B,S). Storing the full
+        # matrix for every layer would cost ~100x more for nothing: the selector only
+        # needs a per-key scalar. RETURNED, not sown: `sow` is a side effect that does
+        # NOT survive the nnx bridge (measured -- nnx.pop finds nothing), and more
+        # fundamentally A2R must CONSUME this score inside the SAME jitted forward in
+        # order to pick the memory; a side channel cannot do that. nn.scan stacks the
+        # returned value along depth for free, giving (depth, B, S).
+        mem_rel = probs.mean(axis=(1, 2, 3))          # (B, S) 每个记忆方块一个分数
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
 
@@ -105,7 +115,7 @@ class MemoryAttention(nn.Module):
             name="out_einsum_mem",
             init_fn=nn.initializers.lecun_normal(in_axis=(-3, -2), out_axis=-1),
         )
-        return out_einsum("BTNH,NHD->BTD", encoded)
+        return out_einsum("BTNH,NHD->BTD", encoded), mem_rel
 
 
 @at.typecheck
@@ -171,11 +181,13 @@ class HistoryBlock(nn.Module):
 
         out = []
         gates = []
+        # scan 要求每层返回结构一致，所以非 modulation 分支也要有这个名字（None 是合法 pytree）
+        mem_rel = None
         for i, (x, config) in enumerate(zip(xs, self.configs, strict=True)):
             if x is not None:
                 # Add Memory Modulation before FFN
                 if i == len(xs) - 1 and self.integration_type == "modulation":
-                    mem_mod_vec = mem_attn(x, mem_seq[-1], mem_mask[-1])
+                    mem_mod_vec, mem_rel = mem_attn(x, mem_seq[-1], mem_mask[-1])
                     x = MemoryRMSNorm(name="mem_rms_norm_ffn")(x, mem_mod_vec)  
                 
                 name=_name("pre_ffw_norm", i) if self.integration_type != "expert" else _name("pre_ffw_norm", i-1)
@@ -202,7 +214,7 @@ class HistoryBlock(nn.Module):
         ]
         xs = sharding.activation_sharding_constraint(xs)
         
-        return xs, kv_cache
+        return xs, (kv_cache, mem_rel)
 
 
 KVCache: TypeAlias = tuple[
@@ -240,6 +252,10 @@ class Module(nn.Module):
         )
         self.layers = nn.scan(
             block_cls,
+            # A2R relevance no longer travels via `sow` (it does not survive the nnx
+            # bridge and cannot be consumed inside the jitted forward), so no extra
+            # collection is needed here -- it rides HistoryBlock's second return value,
+            # which nn.scan already stacks along depth.
             variable_axes={"params": 0},
             split_rngs={"params": True, "dropout": True},
             in_axes=(
@@ -279,13 +295,14 @@ class Module(nn.Module):
         mem_seq: Sequence[at.Float[at.Array, "b lmem _d"] | None] | None = None,
         mem_mask: Sequence[at.Bool[at.Array, "b lmem"] | None] | None = None,
         deterministic: bool = True,
-    ) -> tuple[Sequence[at.Float[at.Array, "b _t _d"] | None], KVCache]:
+        return_mem_rel: bool = False,
+    ) -> tuple:
         embedded = jax.tree.map(lambda e: e.astype(self.embed_dtype), embedded)
         mask = jnp.asarray(mask)[:, None, :, :]
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, kv_cache = self.layers(
+        embedded, (kv_cache, mem_rel) = self.layers(
             embedded,
             kv_cache,
             positions,
@@ -300,10 +317,14 @@ class Module(nn.Module):
             e.dtype == jnp.dtype(self.embed_dtype) for e in embedded if e is not None
         )
 
-        return [
+        outs = [
             f(e, a)[0] if e is not None else e
             for f, e, a in zip(self.final_norms, embedded, adarms_cond, strict=True)
-        ], kv_cache
+        ]
+        # 默认分支的返回值与改动前逐字节一致 -> 现有 9 处调用点无需改动。
+        if return_mem_rel:
+            return outs, kv_cache, mem_rel
+        return outs, kv_cache
 
     def init(self, use_adarms: Sequence[bool], mem_mods: Sequence[bool]):
         """Convenience method for initializing all parameters, necessary due to the quirks of linen."""

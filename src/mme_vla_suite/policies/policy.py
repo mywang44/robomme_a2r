@@ -147,6 +147,14 @@ class MME_VLA_Policy:
                 static_image_emb, static_pos_emb, static_state_emb, static_mask = \
                     self.mem_buffer.prepare_token_dropping(
                         self.step_idx, token_budget, history_feats_gather_fn)
+            elif self.config.perceptual_memory.type == "a2r":
+                # 和训练侧 prepare_a2r 完全一致：均匀采样 cand_frames 帧、每帧全部格子。
+                token_per_image = self.config.token_per_image
+                n_f = int(getattr(self.config.perceptual_memory, "cand_frames", 8))
+                n_cand = n_f * token_per_image * self.config.num_views
+                static_image_emb, static_pos_emb, static_state_emb, static_mask = \
+                    self.mem_buffer.prepare_frame_sampling(
+                        self.step_idx, n_cand, token_per_image, history_feats_gather_fn)
             else:
                 token_per_image = self.config.token_per_image
                 static_image_emb, static_pos_emb, static_state_emb, static_mask = \

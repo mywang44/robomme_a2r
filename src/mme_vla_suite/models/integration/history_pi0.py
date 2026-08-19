@@ -24,6 +24,7 @@ from mme_vla_suite.models.integration.history_observation import (
 )
 from mme_vla_suite.models.integration import history_gemma as _gemma
 from mme_vla_suite.models.config.utils import get_history_config
+from mme_vla_suite.models.integration import a2r_select as _a2r
 
 
 logger = logging.getLogger("history-pi0")
@@ -285,6 +286,17 @@ class HistoryPi0(BaseModel):
             )
             if self.representation_type == "perceptual":
                 print(f"Perceptual Memory using {self.history_config.perceptual_memory.type} type\n")
+                pm = self.history_config.perceptual_memory
+                self.is_a2r = pm.type == "a2r"
+                if self.is_a2r:
+                    self.a2r_budget = int(self.history_config.budget)
+                    self.a2r_per_frame = int(self.history_config.token_per_image) * int(self.history_config.num_views)
+                    self.a2r_frames = int(getattr(pm, "cand_frames", 8))
+                    self.a2r_layer = int(getattr(pm, "attn_layer", 17))
+                    self.a2r_nov_share = float(getattr(pm, "nov_share", 0.5))
+                    print(f"A2R: {self.a2r_frames} frames x {self.a2r_per_frame} cells = "
+                          f"{self.a2r_frames * self.a2r_per_frame} candidates -> budget {self.a2r_budget}, "
+                          f"attn layer {self.a2r_layer}, novelty share {self.a2r_nov_share}\n")
             elif self.representation_type == "recurrent":
                 print(f"Recurrent Memory using {self.history_config.recurrent_memory.type} type\n")
             else:
@@ -554,6 +566,39 @@ class HistoryPi0(BaseModel):
         return tokens, input_mask, ar_mask, na_mask, adarms_cond
 
     @override
+    def _a2r_pick(self, observation, prefix_tokens, attn_mask, positions,
+                  zero_actions, mem_seq_all, mem_mask_all, stats):
+        """A2R 的第一趟前向：给全部候选打分，选出 budget 个真正进记忆。
+
+        查询用「全零动作 + 去噪时间步固定取正中间」，不能用真实带噪动作——后者掺着
+        正确答案，而推理时没有答案，用了会让训练选出的记忆在推理时复现不了。
+        这一趟只取注意力，不回传梯度；第二趟由调用方用选出的格子正式跑。
+        """
+        mid_t = jnp.full(zero_actions.shape[:-2], 0.5)
+        zs_tokens, _zm, _za, _zn, zs_adarms = self.embed_suffix(
+            observation, zero_actions, mid_t)
+        rel_all = self.PaliGemma.llm(
+            [prefix_tokens, zs_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, zs_adarms],
+            mem_seq=[None, mem_seq_all],
+            mem_mask=[None, mem_mask_all],
+            return_mem_rel=True,
+        )[2]
+        rel = jax.lax.stop_gradient(rel_all[self.a2r_layer])           # (B, n_cand)
+        nov = _a2r.novelty_scores(
+            jax.lax.stop_gradient(observation.static_image_emb.astype(jnp.float32)),
+            mem_mask_all, self.a2r_frames, self.a2r_per_frame)
+        idx = _a2r.union_select(nov, rel, mem_mask_all,
+                                self.a2r_budget, self.a2r_nov_share)
+        sel_seq, sel_mask = _a2r.gather_memory(mem_seq_all, mem_mask_all, idx)
+        dbg = _a2r.selection_stats(nov, rel, mem_mask_all,
+                                   self.a2r_budget, self.a2r_nov_share)
+        stats = dict(stats or {})
+        stats.update({"a2r_" + k: v for k, v in dbg.items()})
+        return sel_seq, sel_mask, stats
+
     def compute_loss(
         self,
         rng: at.KeyArrayLike,
@@ -561,7 +606,8 @@ class HistoryPi0(BaseModel):
         actions: Actions,
         *,
         train: bool = False,
-    ) -> at.Float[at.Array, "*b ah"]:
+        return_mem_rel: bool = False,
+    ) -> tuple:
         preprocess_rng, noise_rng, time_rng = jax.random.split(rng, 3)
         observation = preprocess_observation(preprocess_rng, observation, train=train)
 
@@ -606,6 +652,7 @@ class HistoryPi0(BaseModel):
             
         positions = jnp.cumsum(input_mask, axis=1) - 1
 
+        _mem_rel = None
         if self.integration_type == "expert":
             (mem_out, prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [mem_tokens, prefix_tokens, suffix_tokens],
@@ -615,14 +662,23 @@ class HistoryPi0(BaseModel):
             )
         elif self.integration_type == "modulation":
             mem_seq, mem_mask, _, _, stats = self.embed_memory(observation)
-            (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+            if getattr(self, "is_a2r", False):
+                mem_seq, mem_mask, stats = self._a2r_pick(
+                    observation, prefix_tokens, attn_mask, positions,
+                    jnp.zeros_like(x_t), mem_seq, mem_mask, stats)
+            _llm_out = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
                 mask=attn_mask,
                 positions=positions,
                 adarms_cond=[None, adarms_cond],
                 mem_seq=[None, mem_seq],
                 mem_mask=[None, mem_mask],
+                return_mem_rel=return_mem_rel,
             )
+            if return_mem_rel:
+                (prefix_out, suffix_out), _, _mem_rel = _llm_out
+            else:
+                (prefix_out, suffix_out), _ = _llm_out
         else:
             (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                 [prefix_tokens, suffix_tokens],
@@ -635,7 +691,10 @@ class HistoryPi0(BaseModel):
         
         # import pdb; pdb.set_trace()
 
-        return jnp.mean(jnp.square(v_t - u_t), axis=-1), stats
+        _loss = jnp.mean(jnp.square(v_t - u_t), axis=-1)
+        if return_mem_rel:
+            return _loss, stats, _mem_rel
+        return _loss, stats
 
     @override
     def sample_actions(
@@ -781,4 +840,3 @@ class HistoryPi0(BaseModel):
         out = einops.rearrange(out, "(k v) p d -> k v p d", k=shape[0], v=shape[1])
         
         return out
-        

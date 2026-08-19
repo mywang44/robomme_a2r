@@ -6,15 +6,24 @@ import shutil
 from env_runner import EnvRunner
 from utils import EpisodeState, SUBGOAL_TYPES, TASK_WITH_VIDEO_DEMO
 
-from subgoal_prediction.gemini.api import GeminiModel
+try:
+    from subgoal_prediction.gemini.api import GeminiModel
+except Exception as _e:
+    GeminiModel = None  # lazy: perceptual eval doesn't need it
 from subgoal_prediction.gemini.prompts import (
     DEMO_TEXT_QUERY,
     IMAGE_TEXT_QUERY,
     VIDEO_TEXT_QUERY,
 )
 
-from subgoal_prediction.qwenvl.api import Qwen3VLModel
-from subgoal_prediction.qwenvl.api_memer import Qwen3VLModelMemER
+try:
+    from subgoal_prediction.qwenvl.api import Qwen3VLModel
+except Exception as _e:
+    Qwen3VLModel = None  # lazy: perceptual eval doesn't need it
+try:
+    from subgoal_prediction.qwenvl.api_memer import Qwen3VLModelMemER
+except Exception as _e:
+    Qwen3VLModelMemER = None  # lazy: perceptual eval doesn't need it
 
 
 LONG_FIRST_ACTION_TASKS = [

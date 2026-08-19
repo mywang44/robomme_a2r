@@ -129,6 +129,21 @@ class RoboMMEDataset(Dataset):
             kept_indices=kept_indices, epis_idx=epis_idx)
         
 
+    def prepare_a2r(self, epis_idx, step_idx):
+        """A2R 候选池：均匀因果采样 cand_frames 帧，每帧的格子全要，不做任何 novelty 预筛。
+
+        候选数 = cand_frames * token_per_image * num_views，通常 **大于** budget。
+        「从候选里挑哪些进记忆」是模型内部的事（novelty 前一半 ∪ 注意力前一半），
+        这里只负责供货。复用 frame_sampling 那条已验证的路径，只是把 token_budget
+        换成候选数——所以帧的选法、右侧补齐、mask 语义全都和 FrameSamp 一致。
+        """
+        tpi = int(self.history_config.token_per_image)
+        n_f = int(getattr(self.history_config.perceptual_memory, "cand_frames", 8))
+        n_cand = n_f * tpi * self.num_views
+        return self.mem_buffer.prepare_frame_sampling(
+            step_idx, n_cand, tpi, self._gather_history_feat, epis_idx=epis_idx)
+
+
     def prepare_frame_sampling(self,  epis_idx,  step_idx):
         token_per_image = self.history_config.token_per_image
         token_budget = self.history_config.budget
@@ -223,6 +238,13 @@ class RoboMMEDataset(Dataset):
                         static_state_emb,
                         static_mask, # >=64
                     ) = self.prepare_token_drop(epis_idx, step_idx)
+                elif self.history_config.perceptual_memory.type == "a2r":
+                    (
+                        static_img_emb,
+                        static_pos_emb,
+                        static_state_emb,
+                        static_mask,   # 长度 = cand_frames * token_per_image（可 > budget）
+                    ) = self.prepare_a2r(epis_idx, step_idx)
                 else:
                     (
                         static_img_emb,

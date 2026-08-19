@@ -34,7 +34,9 @@ class PerceptualMemory(nnx.Module):
         static_state_emb: at.Float[at.Array, "b l d3"],
     ):
         # get memory tokens using feature encoder
-        assert static_image_emb.shape[1] == self.config.budget
+        # A2R 的候选池比 budget 大（选择在模型内部做），所以这里不能再要求等长。
+        # 这一步只是逐 token 的特征编码，与序列长度无关。
+        assert static_image_emb.shape[1] > 0
 
         hidden_states = self.feature_encoder.encode_perceptual_memory(
             static_image_emb, static_pos_emb, static_state_emb
