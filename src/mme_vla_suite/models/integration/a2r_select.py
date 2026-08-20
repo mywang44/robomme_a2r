@@ -47,8 +47,9 @@ def union_select(nov, rel, static_mask, budget, nov_share=0.5):
     返回 (B, budget) 的 int32 下标，升序——升序即时间顺序（槽位编号 = 帧号*per_frame+格号），
     而 MemoryAttention 会按位置给 key 上 RoPE，所以顺序不能乱。
 
-    并集通常不足 budget（两边有重叠），空出来的名额按 relevance 从高到低递补，
-    而不是像 GR00T 那样重复最后一个——重复会浪费名额。
+    并集通常不足 budget（两边有重叠）。空出来的名额**重复最后一个下标**补齐，
+    与 GR00T 的 `_patch_union_mem_seq` 一致（`u[-1:].expand(budget - u.numel())`）。
+    这样两边的记忆内容才等价，实验结果的差异才只能归因于选择规则本身。
     """
     B, N = nov.shape
     k_nov = max(1, int(round(budget * nov_share)))
@@ -59,15 +60,14 @@ def union_select(nov, rel, static_mask, budget, nov_share=0.5):
     if k_rel > 0:
         keep = keep | _topk_mask(rel, k_rel, N)
 
-    # 递补用的次序：把 relevance 压到 [0,1]，保证它永远盖不过“已入选”那一档
-    lo = jnp.min(jnp.where(static_mask, rel, jnp.inf), axis=-1, keepdims=True)
-    hi = jnp.max(jnp.where(static_mask, rel, -jnp.inf), axis=-1, keepdims=True)
-    tie = (rel - lo) / jnp.maximum(hi - lo, 1e-6)
-    tie = jnp.clip(tie, 0.0, 1.0)
-
-    composite = jnp.where(static_mask, keep.astype(jnp.float32) * 2.0 + tie, NEG)
-    idx = jnp.argsort(composite, axis=-1)[:, ::-1][:, :budget]  # (B, budget)
-    return jnp.sort(idx, axis=-1).astype(jnp.int32)
+    # 先按“是否入选”排序取前 budget，未入选的位置标成 N（哨兵），随后被最后一个真下标顶掉。
+    order = jnp.where(keep, jnp.arange(N)[None, :], N)
+    order = jnp.sort(order, axis=-1)[:, :budget]                 # 升序 = 时间顺序，哨兵沉底
+    # 每行最后一个真下标：并集大小 - 1
+    n_keep = jnp.sum(keep, axis=-1, keepdims=True)               # (B, 1)
+    last = jnp.take_along_axis(order, jnp.maximum(n_keep - 1, 0), axis=-1)
+    idx = jnp.where(order >= N, last, order)                     # 哨兵位 -> 重复最后一个
+    return idx.astype(jnp.int32)
 
 
 def gather_memory(mem_seq, mem_mask, idx):

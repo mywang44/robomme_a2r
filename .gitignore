@@ -207,3 +207,7 @@ marimo/_lsp/
 __marimo__/
 
 *local.sh
+# pod 上软链到导师目录 / 本地产物，不入库
+/data
+/runs/
+nohup.out

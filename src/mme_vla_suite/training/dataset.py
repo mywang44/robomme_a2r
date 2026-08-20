@@ -140,8 +140,14 @@ class RoboMMEDataset(Dataset):
         tpi = int(self.history_config.token_per_image)
         n_f = int(getattr(self.history_config.perceptual_memory, "cand_frames", 8))
         n_cand = n_f * tpi * self.num_views
+        # 传 step_idx-1 而不是 step_idx：均匀采样是 linspace(0, 上界, n)，末位就是上界，
+        # 传 step_idx 会把**当前帧本身**放进候选池。当前帧的格子跟当前观测完全匹配，
+        # relevance 天然给高分，会优先占掉名额、把真正的历史挤出去；而且完全冗余——
+        # 当前画面已经在 prefix 里了。GR00T 训练端的 _fs_pu_indices 同样排除锚点。
+        # step_idx=0 时钳到 0（没有历史可选，只能是它自己，由 mask 兜底）。
         return self.mem_buffer.prepare_frame_sampling(
-            step_idx, n_cand, tpi, self._gather_history_feat, epis_idx=epis_idx)
+            max(int(step_idx) - 1, 0), n_cand, tpi,
+            self._gather_history_feat, epis_idx=epis_idx)
 
 
     def prepare_frame_sampling(self,  epis_idx,  step_idx):
