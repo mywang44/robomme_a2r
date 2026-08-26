@@ -128,8 +128,6 @@ class HistoryBlock(nn.Module):
     dropout_bdims: tuple[int, ...] = ()
 
     integration_type: str | None = None
-    # A2R 推理端：让主注意力额外吐出「动作对 prefix 每一列的注意力」。
-    want_obs_attn: bool = False
 
     @nn.compact
     def __call__(
@@ -157,8 +155,7 @@ class HistoryBlock(nn.Module):
         if self.integration_type == "expert":
             attn = Attention_with_MemoryExpert(configs=self.configs, name="attn")
         else:
-            attn = Attention(configs=self.configs, name="attn",
-                             capture_obs_attn=self.want_obs_attn)
+            attn = Attention(configs=self.configs, name="attn")
 
         pre_attn = []
         gates = []
@@ -172,11 +169,7 @@ class HistoryBlock(nn.Module):
             gates.append(gate if x is not None else None)
 
         pre_attn = sharding.activation_sharding_constraint(pre_attn)
-        if self.want_obs_attn and self.integration_type != "expert":
-            post_attn, kv_cache, obs_attn = attn(pre_attn, positions, attn_mask, kv_cache)
-        else:
-            post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
-            obs_attn = None
+        post_attn, kv_cache = attn(pre_attn, positions, attn_mask, kv_cache)
         post_attn = jax.tree.map(lambda x: drop(x, deterministic), post_attn)
         post_attn = sharding.activation_sharding_constraint(post_attn)
         xs = [
@@ -221,7 +214,7 @@ class HistoryBlock(nn.Module):
         ]
         xs = sharding.activation_sharding_constraint(xs)
         
-        return xs, (kv_cache, mem_rel, obs_attn)
+        return xs, (kv_cache, mem_rel)
 
 
 KVCache: TypeAlias = tuple[
@@ -241,9 +234,6 @@ class Module(nn.Module):
     adarms: bool = False
     
     integration_type: str | None = None
-    # A2R 推理端：让每层的主注意力吐出「动作对 prefix 每一列的注意力」，沿 depth 堆叠返回。
-    # 编译期常量，为 False 时 Attention 里那个分支不进图，非 A2R 配置零开销。
-    want_obs_attn: bool = False
 
     def setup(self):
         # all experts must have the same depth
@@ -283,7 +273,6 @@ class Module(nn.Module):
             dropout=self.dropout,
             dropout_bdims=self.dropout_bdims,
             integration_type=self.integration_type,
-            want_obs_attn=self.want_obs_attn,
         )
         self.final_norms = [
             RMSNorm(name=_name("final_norm", i) if self.integration_type != "expert" else _name("final_norm", i-1)) for i in range(len(self.configs))
@@ -313,7 +302,7 @@ class Module(nn.Module):
         if adarms_cond is None:
             adarms_cond = [None] * len(self.configs)
 
-        embedded, (kv_cache, mem_rel, obs_attn) = self.layers(
+        embedded, (kv_cache, mem_rel) = self.layers(
             embedded,
             kv_cache,
             positions,
@@ -334,9 +323,7 @@ class Module(nn.Module):
         ]
         # 默认分支的返回值与改动前逐字节一致 -> 现有 9 处调用点无需改动。
         if return_mem_rel:
-            # 第 3 位是 mem_rel（训练端按 [2] 取，行为不变），第 4 位是主注意力对
-            # prefix 的注意力（A2R 推理端用；want_obs_attn 关时为 None）。
-            return outs, kv_cache, mem_rel, obs_attn
+            return outs, kv_cache, mem_rel
         return outs, kv_cache
 
     def init(self, use_adarms: Sequence[bool], mem_mods: Sequence[bool]):

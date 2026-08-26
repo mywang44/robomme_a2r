@@ -331,7 +331,6 @@ class HistoryPi0(BaseModel):
                         embed_dtype=config.dtype,
                         adarms=config.pi05,
                         integration_type=self.integration_type,
-                        want_obs_attn=getattr(self, "is_a2r", False),
                     )
                 )
                 llm.lazy_init(
@@ -677,8 +676,7 @@ class HistoryPi0(BaseModel):
                 return_mem_rel=return_mem_rel,
             )
             if return_mem_rel:
-                # Module 现在返回 (outs, kv_cache, mem_rel, obs_attn)；obs_attn 训练用不到。
-                (prefix_out, suffix_out), _, _mem_rel, _ = _llm_out
+                (prefix_out, suffix_out), _, _mem_rel = _llm_out
             else:
                 (prefix_out, suffix_out), _ = _llm_out
         else:
@@ -757,14 +755,8 @@ class HistoryPi0(BaseModel):
             )
             
 
-        # A2R 只在 modulation 下生效；非 A2R 时 attn_acc 恒为 None（while_loop 的 carry 里
-        # None 是合法的空 pytree 节点，不占形状）。
-        _a2r = getattr(self, "is_a2r", False) and self.integration_type == "modulation"
-        n_prefix = prefix_mask.shape[1]
-        _attn_init = (jnp.zeros((batch_size, n_prefix), jnp.float32) if _a2r else None)
-
         def step(carry):
-            x_t, time, attn_acc = carry
+            x_t, time = carry
             suffix_tokens, suffix_mask, suffix_ar_mask, _, adarms_cond = (
                 self.embed_suffix(observation, x_t, jnp.broadcast_to(time, batch_size))
             )
@@ -803,30 +795,15 @@ class HistoryPi0(BaseModel):
                 )
                 assert mem_out is None
             elif self.integration_type == "modulation":
-                if _a2r:
-                    # A2R：同一趟真实去噪里把「动作对 prefix 每一列的注意力」带出来，
-                    # 与 GR00T 推理端一致（它也是从真实去噪那趟抓、跨去噪步累加）。
-                    (prefix_out, suffix_out), _, _mr, _oa = self.PaliGemma.llm(
-                        [None, suffix_tokens],
-                        mask=full_attn_mask,
-                        positions=positions,
-                        kv_cache=kv_cache,
-                        adarms_cond=[None, adarms_cond],
-                        mem_seq=[None, mem_seq],
-                        mem_mask=[None, mem_mask],
-                        return_mem_rel=True,
-                    )
-                    attn_acc = attn_acc + _oa[self.a2r_layer][:, :n_prefix]
-                else:
-                    (prefix_out, suffix_out), _ = self.PaliGemma.llm(
-                        [None, suffix_tokens],
-                        mask=full_attn_mask,
-                        positions=positions,
-                        kv_cache=kv_cache,
-                        adarms_cond=[None, adarms_cond],
-                        mem_seq=[None, mem_seq],
-                        mem_mask=[None, mem_mask],
-                    )
+                (prefix_out, suffix_out), _ = self.PaliGemma.llm(
+                    [None, suffix_tokens],
+                    mask=full_attn_mask,
+                    positions=positions,
+                    kv_cache=kv_cache,
+                    adarms_cond=[None, adarms_cond],
+                    mem_seq=[None, mem_seq],
+                    mem_mask=[None, mem_mask],
+                )
             else:
                 (prefix_out, suffix_out), _ = self.PaliGemma.llm(
                     [None, suffix_tokens],
@@ -839,19 +816,14 @@ class HistoryPi0(BaseModel):
             assert prefix_out is None
             v_t = self.action_out_proj(suffix_out[:, -self.action_horizon :])
 
-            return x_t + dt * v_t, time + dt, attn_acc
+            return x_t + dt * v_t, time + dt
 
         def cond(carry):
-            x_t, time, _ = carry
+            x_t, time = carry
             # robust to floating-point error
             return time >= -dt / 2
 
-        x_0, _, attn_acc = jax.lax.while_loop(
-            cond, step, (noise, 1.0, _attn_init))
-        if _a2r:
-            # 返回 (动作, 跨去噪步累加的 prefix 注意力)。宿主侧据此给当前帧的格子打分，
-            # 再写进滚动记忆的堆里（policy.py）。
-            return x_0, attn_acc
+        x_0, _ = jax.lax.while_loop(cond, step, (noise, 1.0))
         return x_0
     
     
