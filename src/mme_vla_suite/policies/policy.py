@@ -152,9 +152,13 @@ class MME_VLA_Policy:
                 token_per_image = self.config.token_per_image
                 n_f = int(getattr(self.config.perceptual_memory, "cand_frames", 8))
                 n_cand = n_f * token_per_image * self.config.num_views
+                # 传 step_idx-1：均匀采样的末位就是上界，传 step_idx 会把当前帧放进候选池。
+                # 训练侧 prepare_a2r 同样传 step_idx-1（提交 6013139），两边必须一致，
+                # 否则推理的记忆内容分布和训练对不上。
                 static_image_emb, static_pos_emb, static_state_emb, static_mask = \
                     self.mem_buffer.prepare_frame_sampling(
-                        self.step_idx, n_cand, token_per_image, history_feats_gather_fn)
+                        max(int(self.step_idx) - 1, 0), n_cand, token_per_image,
+                        history_feats_gather_fn)
             else:
                 token_per_image = self.config.token_per_image
                 static_image_emb, static_pos_emb, static_state_emb, static_mask = \

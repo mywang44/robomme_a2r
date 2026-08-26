@@ -696,6 +696,52 @@ class HistoryPi0(BaseModel):
             return _loss, stats, _mem_rel
         return _loss, stats
 
+    def _a2r_pick_infer(self, observation, prefix_mask, kv_cache,
+                        mem_seq_all, mem_mask_all, batch_size):
+        """推理端的第一趟前向 + 选择。**逐项复刻训练端 `_a2r_pick`**：
+
+            查询动作   全零              （同训练：真实带噪动作掺着答案，推理没有答案）
+            时间步     固定 0.5          （同训练：只用于排序，不能带随机抖动）
+            打分模块   MemoryAttention 第 a2r_layer 层（**同一模块、同一份权重**）
+            novelty    _a2r.novelty_scores（同一函数、同一公式）
+            选择       _a2r.union_select  （同一函数、同一补齐规则）
+
+        为什么必须逐项一致：模型学到的是「按这套规则挑出来的记忆长什么样」。推理换任何
+        一项——换打分模块、换补齐方式、换候选池构造——都等于喂给它一份没见过的记忆。
+
+        与训练唯一的实现差异：这里只跑后缀那一支（`[None, zs_tokens]` + `kv_cache`）。
+        前缀在进入去噪循环之前已经算过一次并存进缓存，记忆走的是独立的 MemoryAttention、
+        不影响前缀的键值，所以复用是精确的、不是近似。
+        """
+        zeros = jnp.zeros((batch_size, self.action_horizon, self.action_dim),
+                          dtype=jnp.float32)
+        mid_t = jnp.full((batch_size,), 0.5)
+        zs_tokens, zs_mask, zs_ar, _zn, zs_adarms = self.embed_suffix(
+            observation, zeros, mid_t)
+        # 掩码与位置的拼法照抄 step()：后缀内部的 + 后缀看前缀的
+        sfx = make_attn_mask(zs_mask, zs_ar)
+        pfx = einops.repeat(prefix_mask, "b p -> b s p", s=zs_tokens.shape[1])
+        full_mask = jnp.concatenate([pfx, sfx], axis=-1)
+        pos = (jnp.sum(prefix_mask, axis=-1)[:, None]
+               + jnp.cumsum(zs_mask, axis=-1) - 1)
+        rel_all = self.PaliGemma.llm(
+            [None, zs_tokens],
+            mask=full_mask,
+            positions=pos,
+            kv_cache=kv_cache,
+            adarms_cond=[None, zs_adarms],
+            mem_seq=[None, mem_seq_all],
+            mem_mask=[None, mem_mask_all],
+            return_mem_rel=True,
+        )[2]
+        rel = rel_all[self.a2r_layer]                                  # (B, n_cand)
+        nov = _a2r.novelty_scores(
+            observation.static_image_emb.astype(jnp.float32),
+            mem_mask_all, self.a2r_frames, self.a2r_per_frame)
+        idx = _a2r.union_select(nov, rel, mem_mask_all,
+                                self.a2r_budget, self.a2r_nov_share)
+        return _a2r.gather_memory(mem_seq_all, mem_mask_all, idx)
+
     @override
     def sample_actions(
         self,
@@ -742,7 +788,11 @@ class HistoryPi0(BaseModel):
                 [prefix_tokens, None], mask=prefix_attn_mask, positions=positions
             )
             mem_seq, mem_mask, _, _, _ = self.embed_memory(observation)
-            
+            if getattr(self, "is_a2r", False):
+                # 从 n_cand 个候选里选出 budget 个，和训练端 compute_loss 里的那一步同源。
+                mem_seq, mem_mask = self._a2r_pick_infer(
+                    observation, prefix_mask, kv_cache, mem_seq, mem_mask, batch_size)
+
         else:
             prefix_tokens, prefix_mask, prefix_ar_mask, prefix_na_mask, _ = self.embed_prefix(observation)
             if self.integration_type == "context":
