@@ -159,6 +159,10 @@ class Attention(nn.Module):
     """Attention module."""
 
     configs: Sequence[Config]
+    # A2R 专用：额外返回「对 KV 每一列的注意力」（头与查询位置都平均掉），供推理端给当前
+    # 观测的格子打分。这是**编译期常量**：为 False 时下面那个分支根本不进计算图，probs 仍
+    # 然只有 einsum 一个消费者，softmax->matmul 的融合不受影响，非 A2R 配置与上游逐字节一致。
+    capture_obs_attn: bool = False
 
     @nn.compact
     def __call__(self, xs, positions, attn_mask, kv_cache):
@@ -226,6 +230,9 @@ class Attention(nn.Module):
         masked_logits = jnp.where(attn_mask[:, :, None, :, :], logits, big_neg)
 
         probs = jax.nn.softmax(masked_logits, axis=-1).astype(dtype)
+        # (B, K, G, T, S) -> (B, S)：把 kv 头、头组、以及全部查询位置平均掉，
+        # 与 MemoryAttention 里 mem_rel 的归约方式保持一致。
+        obs_attn = probs.mean(axis=(1, 2, 3)) if self.capture_obs_attn else None
 
         encoded = jnp.einsum("BKGTS,BSKH->BTKGH", probs, v)
         encoded = einops.rearrange(encoded, "B T K G H -> B T (K G) H")
@@ -246,6 +253,8 @@ class Attention(nn.Module):
             else:
                 out.append(None)
 
+        if self.capture_obs_attn:
+            return out, (k, v), obs_attn
         return out, (k, v)
 
 
