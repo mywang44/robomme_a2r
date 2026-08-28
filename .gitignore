@@ -211,3 +211,6 @@ __marimo__/
 /data
 /runs/
 nohup.out
+
+# 评测产物：任何层级的 runs/ 都不入库（examples/robomme/runs 曾漏网）
+runs/
